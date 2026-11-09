@@ -3,7 +3,7 @@
 import pytest
 from src.byzantine.behaviors import ByzantineMode
 from src.consensus.proposer import TimeoutConfig, get_proposer
-from src.core.types import Transaction
+from src.core.types import Transaction, Vote
 from src.crypto.keys import KeyPair
 from src.crypto.sign import get_tx_domain, sign_payload
 from src.logging.logger import DeterministicLogger
@@ -166,6 +166,124 @@ def test_scenario_t6_silent_crashed_proposer():
     # All honest nodes agree on finalized block hash
     honest_hashes = {n.engine.ledger[0].hash() for n in honest_nodes}
     assert len(honest_hashes) == 1, "Honest nodes must agree on block hash"
+
+
+def test_scenario_t2_duplicate_and_reordered_messages():
+    """T2: Duplicate and reordered messages. No double-counted votes, no conflicting finalization."""
+    fault_cfg = NetworkFaultConfig(
+        drop_rate=0.0,
+        duplicate_rate=0.4,
+        min_delay=0.02,
+        max_delay=0.15,
+        t_stabilize=0.0,
+        delta=0.2,
+    )
+    net = create_scenario_network(num_validators=10, fault_config=fault_cfg, seed=123)
+    nodes = net["nodes"]
+    sim = net["simulator"]
+    chain_id = net["chain_id"]
+
+    client = KeyPair.from_seed("client_t2")
+    add_tx(nodes, client, "doc_t2", "0x2222", 1, chain_id)
+
+    for node in nodes:
+        node.engine.start_height(1)
+
+    sim.run_until_condition(
+        condition=lambda: all(len(n.engine.ledger) >= 1 for n in nodes),
+        max_time=20.0,
+    )
+
+    assert all(len(n.engine.ledger) >= 1 for n in nodes), "All nodes must finalize height 1"
+    finalized_hashes = {n.engine.ledger[0].hash() for n in nodes}
+    assert len(finalized_hashes) == 1, "Duplicate messages must not cause forks"
+    state_roots = {n.engine.committed_state.compute_merkle_root() for n in nodes}
+    assert len(state_roots) == 1, "State roots must match identically"
+
+
+def test_scenario_t3_invalid_signature_and_cross_domain():
+    """T3: Invalid signature and cross-domain replay rejection."""
+    net = create_scenario_network(num_validators=10, seed=456)
+    nodes = net["nodes"]
+    chain_id = net["chain_id"]
+    validators = net["validators"]
+
+    # Injected vote with wrong domain (TX: instead of VOTE:)
+    val_kp = net["keypairs"][0]
+    bad_domain_vote = Vote(
+        chain_id=chain_id,
+        height=1,
+        round=0,
+        phase="PREVOTE",
+        block_hash="0xabcd" * 16,
+        validator_id=val_kp.public_key_hex,
+    )
+    bad_domain_vote.signature = sign_payload(val_kp, get_tx_domain(chain_id), bad_domain_vote.signing_payload())
+
+    node1 = nodes[1]
+    # Receiver validates and rejects
+    node1.engine.on_receive_vote(bad_domain_vote)
+    # The bad vote must not be added to vote sets
+    vset = node1.engine.vote_sets.get((1, 0, "PREVOTE"))
+    assert (vset is None) or (val_kp.public_key_hex not in vset.votes)
+
+
+def test_scenario_t4_replayed_transaction_rejection():
+    """T4: Replayed and duplicate transaction rejection; state changes applied at most once."""
+    from src.core.state import State
+    state = State()
+    chain_id = "test-chain"
+    client = KeyPair.from_seed("client_t4")
+
+    # Apply transaction nonce 1
+    tx1 = Transaction(sender=client.public_key_hex, doc_id="doc1", doc_hash="0x1111", nonce=1)
+    tx1.signature = sign_payload(client, get_tx_domain(chain_id), tx1.signing_payload())
+
+    ok1, _ = state.apply_transaction(tx1, chain_id)
+    assert ok1 is True
+    assert state.get(f"{client.public_key_hex}/nonce") == "1"
+
+    # Replay same transaction with nonce 1
+    ok2, err2 = state.apply_transaction(tx1, chain_id)
+    assert ok2 is False
+    assert "Invalid nonce: expected 2, got 1" in err2
+    # Nonce remained 1, applied at most once
+    assert state.get(f"{client.public_key_hex}/nonce") == "1"
+
+
+def test_scenario_t5_unreliable_network_before_stabilization():
+    """T5: Drop and delay before T_stabilize. Safety holds throughout, liveness recovered after stabilization."""
+    fault_cfg = NetworkFaultConfig(
+        drop_rate=0.25,
+        duplicate_rate=0.2,
+        min_delay=0.05,
+        max_delay=0.25,
+        t_stabilize=2.0,  # network stabilizes at 2.0s
+        delta=0.2,
+    )
+    net = create_scenario_network(num_validators=10, fault_config=fault_cfg, seed=789)
+    nodes = net["nodes"]
+    sim = net["simulator"]
+    chain_id = net["chain_id"]
+
+    client = KeyPair.from_seed("client_t5")
+    add_tx(nodes, client, "doc_t5", "0x5555", 1, chain_id)
+
+    for node in nodes:
+        node.engine.start_height(1)
+
+    # Run past stabilization until finalization
+    sim.run_until_condition(
+        condition=lambda: all(len(n.engine.ledger) >= 1 for n in nodes),
+        max_time=30.0,
+    )
+
+    # Check that safety holds: no conflicting finalized blocks
+    for n in nodes:
+        assert len(n.engine.ledger) >= 1, "Liveness failed: node did not finalize after stabilization"
+
+    finalized_hashes = {n.engine.ledger[0].hash() for n in nodes}
+    assert len(finalized_hashes) == 1, f"Safety violation under T5! Hashes: {finalized_hashes}"
 
 
 def test_scenario_t7_byzantine_equivocation():

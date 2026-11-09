@@ -107,17 +107,33 @@ class ConsensusEngine:
         self.round = round_num
         self.step = Step.PROPOSE
 
+        # Cancel any previous timeouts for current height/round
+        self._cancel_timeout("PROPOSE", self.height, self.round)
+        self._cancel_timeout("PREVOTE", self.height, self.round)
+        self._cancel_timeout("PRECOMMIT", self.height, self.round)
+
         current_proposer = get_proposer(self.validators, self.height, self.round)
         if self.node_id == current_proposer and self.keypair is not None:
             # This node is the elected proposer
             proposal = self._create_proposal()
             self._broadcast_proposal(proposal)
-            # Locally handle the proposal
             self.on_receive_proposal(proposal)
 
-        # Schedule TimeoutPropose
-        timeout_dur = self.timeout_config.timeout_propose(self.round)
-        self._schedule_timeout("PROPOSE", self.height, self.round, timeout_dur)
+        # Check if proposal for this round was already received asynchronously
+        cached_proposal = self.proposal_blocks.get((self.height, self.round))
+        if cached_proposal is not None:
+            self.on_receive_proposal(cached_proposal)
+        else:
+            # Schedule TimeoutPropose
+            timeout_dur = self.timeout_config.timeout_propose(self.round)
+            self._schedule_timeout("PROPOSE", self.height, self.round, timeout_dur)
+
+        # Process any votes that were buffered before entering this round
+        for phase in (Phase.PREVOTE, Phase.PRECOMMIT):
+            key = (self.height, self.round, phase)
+            if key in self.vote_sets:
+                for v in list(self.vote_sets[key].votes.values()):
+                    self._process_vote_triggers(v)
 
     def _create_proposal(self) -> Block:
         """Constructs a block proposal. If valid_block exists, reproposes it; otherwise creates a new block."""
@@ -232,6 +248,10 @@ class ConsensusEngine:
         self._broadcast_vote(vote)
         self.on_receive_vote(vote)
 
+        # Schedule TimeoutPrevote to guarantee step advancement even under heavy packet drops
+        timeout_dur = self.timeout_config.timeout_prevote(self.round)
+        self._schedule_timeout("PREVOTE", self.height, self.round, timeout_dur)
+
     def _cast_precommit(self, block_hash: Optional[str]) -> None:
         """Signs and broadcasts a PRECOMMIT message if not already signed for this round."""
         if self.keypair is None or self.node_id not in self.validators:
@@ -261,6 +281,10 @@ class ConsensusEngine:
         self._broadcast_vote(vote)
         self.on_receive_vote(vote)
 
+        # Schedule TimeoutPrecommit to guarantee round progression even if precommits are lost
+        timeout_dur = self.timeout_config.timeout_precommit(self.round)
+        self._schedule_timeout("PRECOMMIT", self.height, self.round, timeout_dur)
+
     def on_receive_vote(self, vote: Vote) -> None:
         """Validates and processes an incoming vote."""
         # Rule 6 incoming validation
@@ -283,7 +307,16 @@ class ConsensusEngine:
         if not added:
             return
 
+        self._process_vote_triggers(vote)
+
+    def _process_vote_triggers(self, vote: Vote) -> None:
+        """Processes state machine transitions based on accumulated votes."""
         if vote.height != self.height:
+            return
+
+        key = (vote.height, vote.round, vote.phase)
+        vote_set = self.vote_sets.get(key)
+        if not vote_set:
             return
 
         # Check PREVOTE transitions
@@ -313,18 +346,19 @@ class ConsensusEngine:
                 self._schedule_timeout("PREVOTE", self.height, self.round, timeout_dur)
 
         # Check PRECOMMIT transitions
-        elif vote.phase == Phase.PRECOMMIT and vote.round == self.round:
+        elif vote.phase == Phase.PRECOMMIT:
             has_quorum, q_block_hash = vote_set.get_quorum_block()
             if has_quorum:
-                self._cancel_timeout("PRECOMMIT", self.height, self.round)
                 if q_block_hash is not None:
-                    prop_block = self.proposal_blocks.get((self.height, self.round))
+                    self._cancel_timeout("PRECOMMIT", self.height, self.round)
+                    prop_block = self.proposal_blocks.get((vote.height, vote.round))
                     if prop_block and prop_block.hash() == q_block_hash:
                         self._finalize_block(prop_block)
-                else:
+                elif vote.round == self.round:
+                    self._cancel_timeout("PRECOMMIT", self.height, self.round)
                     if self.step == Step.PRECOMMIT:
                         self._advance_round()
-            elif vote_set.total_votes() >= self.quorum and self.step == Step.PRECOMMIT:
+            elif vote.round == self.round and vote_set.total_votes() >= self.quorum and self.step == Step.PRECOMMIT:
                 timeout_dur = self.timeout_config.timeout_precommit(self.round)
                 self._schedule_timeout("PRECOMMIT", self.height, self.round, timeout_dur)
 

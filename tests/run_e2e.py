@@ -7,7 +7,7 @@ import sys
 import pytest
 from src.byzantine.behaviors import ByzantineMode
 from src.consensus.proposer import get_proposer
-from src.core.types import Transaction
+from src.core.types import Transaction, Vote
 from src.crypto.keys import KeyPair
 from src.crypto.sign import get_tx_domain, sign_payload
 from src.logging.logger import DeterministicLogger
@@ -120,6 +120,119 @@ def run_scenario_t1(seed: int = 42, log_file: str = None) -> bool:
     return ok
 
 
+def run_scenario_t2(seed: int = 42) -> bool:
+    print(f"\n--- Running Scenario T2 (Duplicate/Reordered Messages, seed={seed}) ---")
+    fault_cfg = NetworkFaultConfig(
+        drop_rate=0.0,
+        duplicate_rate=0.4,
+        min_delay=0.02,
+        max_delay=0.15,
+        t_stabilize=0.0,
+        delta=0.2,
+    )
+    sim_data = setup_simulation(num_nodes=10, seed=seed, duplicate_rate=0.4)
+    nodes = sim_data["nodes"]
+    sim = sim_data["simulator"]
+    chain_id = sim_data["chain_id"]
+
+    client = KeyPair.from_seed("client_t2")
+    tx = Transaction(sender=client.public_key_hex, doc_id="doc_t2", doc_hash="0x2222", nonce=1)
+    tx.signature = sign_payload(client, get_tx_domain(chain_id), tx.signing_payload())
+    for n in nodes:
+        n.engine.mempool.append(tx)
+
+    for n in nodes:
+        n.engine.start_height(1)
+
+    sim.run_until_condition(lambda: all(len(n.engine.ledger) >= 1 for n in nodes), max_time=20.0)
+    ok = all(len(n.engine.ledger) >= 1 for n in nodes)
+    if ok:
+        hashes = {n.engine.ledger[0].hash() for n in nodes}
+        ok = len(hashes) == 1
+        if ok:
+            print(f"[SUCCESS] T2 Passed: No double counting or forks under duplicate messages. Block {list(hashes)[0][:12]}")
+    return ok
+
+
+def run_scenario_t3(seed: int = 42) -> bool:
+    print(f"\n--- Running Scenario T3 (Invalid Signature / Wrong Domain, seed={seed}) ---")
+    sim_data = setup_simulation(num_nodes=10, seed=seed)
+    nodes = sim_data["nodes"]
+    chain_id = sim_data["chain_id"]
+    val_kp = sim_data["keypairs"][0]
+
+    # Injected vote with wrong domain (TX: instead of VOTE:)
+    bad_vote = Vote(
+        chain_id=chain_id,
+        height=1,
+        round=0,
+        phase="PREVOTE",
+        block_hash="0xabcd" * 16,
+        validator_id=val_kp.public_key_hex,
+    )
+    bad_vote.signature = sign_payload(val_kp, get_tx_domain(chain_id), bad_vote.signing_payload())
+
+    node1 = nodes[1]
+    node1.engine.on_receive_vote(bad_vote)
+    vset = node1.engine.vote_sets.get((1, 0, "PREVOTE"))
+    ok = (vset is None) or (val_kp.public_key_hex not in vset.votes)
+    if ok:
+        print("[SUCCESS] T3 Passed: Invalid domain signature rejected by consensus guard")
+    return ok
+
+
+def run_scenario_t4(seed: int = 42) -> bool:
+    print(f"\n--- Running Scenario T4 (Replayed/Duplicate Tx Rejection, seed={seed}) ---")
+    from src.core.state import State
+    state = State()
+    chain_id = "test-chain"
+    client = KeyPair.from_seed("client_t4")
+
+    tx1 = Transaction(sender=client.public_key_hex, doc_id="doc1", doc_hash="0x1111", nonce=1)
+    tx1.signature = sign_payload(client, get_tx_domain(chain_id), tx1.signing_payload())
+
+    ok1, _ = state.apply_transaction(tx1, chain_id)
+    ok2, err2 = state.apply_transaction(tx1, chain_id)
+    ok = ok1 and (not ok2) and ("Invalid nonce" in err2)
+    if ok:
+        print(f"[SUCCESS] T4 Passed: Replayed tx rejected correctly ({err2})")
+    return ok
+
+
+def run_scenario_t5(seed: int = 42) -> bool:
+    print(f"\n--- Running Scenario T5 (Drop & Delay Before Stabilize, seed={seed}) ---")
+    sim_data = setup_simulation(
+        num_nodes=10,
+        seed=seed,
+        drop_rate=0.25,
+        duplicate_rate=0.2,
+        t_stabilize=2.0,
+        delta=0.2,
+    )
+    nodes = sim_data["nodes"]
+    sim = sim_data["simulator"]
+    chain_id = sim_data["chain_id"]
+
+    client = KeyPair.from_seed("client_t5")
+    tx = Transaction(sender=client.public_key_hex, doc_id="doc_t5", doc_hash="0x5555", nonce=1)
+    tx.signature = sign_payload(client, get_tx_domain(chain_id), tx.signing_payload())
+    for n in nodes:
+        n.engine.mempool.append(tx)
+
+    for n in nodes:
+        n.engine.start_height(1)
+
+    sim.run_until_condition(lambda: all(len(n.engine.ledger) >= 1 for n in nodes), max_time=30.0)
+
+    ok = all(len(n.engine.ledger) >= 1 for n in nodes)
+    if ok:
+        hashes = {n.engine.ledger[0].hash() for n in nodes}
+        ok = len(hashes) == 1
+        if ok:
+            print(f"[SUCCESS] T5 Passed: Safety preserved during drops, liveness achieved after stabilization. Block {list(hashes)[0][:12]}")
+    return ok
+
+
 def run_scenario_t6(seed: int = 42) -> bool:
     print(f"\n--- Running Scenario T6 (Silent Proposer Timeout, seed={seed}) ---")
     sim_data = setup_simulation(num_nodes=10, byzantine_count=0, seed=seed)
@@ -218,26 +331,29 @@ def run_scenario_t8(seed: int = 42) -> bool:
 def main():
     parser = argparse.ArgumentParser(description="Lab 01 Consensus Simulator CLI")
     parser.add_argument("--all", action="store_true", help="Run full suite: unit tests and scenarios")
-    parser.add_argument("--scenario", type=str, choices=["T1", "T6", "T7", "T8"], help="Run a specific scenario")
+    parser.add_argument("--scenario", type=str, choices=["T1", "T2", "T3", "T4", "T5", "T6", "T7", "T8"], help="Run a specific scenario")
     parser.add_argument("--nodes", type=int, default=10, help="Number of validator nodes (default: 10)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for simulation determinism")
     args = parser.parse_args()
 
+    scenarios = {
+        "T1": lambda: run_scenario_t1(seed=args.seed),
+        "T2": lambda: run_scenario_t2(seed=args.seed),
+        "T3": lambda: run_scenario_t3(seed=args.seed),
+        "T4": lambda: run_scenario_t4(seed=args.seed),
+        "T5": lambda: run_scenario_t5(seed=args.seed),
+        "T6": lambda: run_scenario_t6(seed=args.seed),
+        "T7": lambda: run_scenario_t7(seed=args.seed),
+        "T8": lambda: run_scenario_t8(seed=args.seed),
+    }
+
     success = True
     if args.all or not args.scenario:
         success = run_unit_tests() and success
-        success = run_scenario_t1(seed=args.seed) and success
-        success = run_scenario_t6(seed=args.seed) and success
-        success = run_scenario_t7(seed=args.seed) and success
-        success = run_scenario_t8(seed=args.seed) and success
-    elif args.scenario == "T1":
-        success = run_scenario_t1(seed=args.seed)
-    elif args.scenario == "T6":
-        success = run_scenario_t6(seed=args.seed)
-    elif args.scenario == "T7":
-        success = run_scenario_t7(seed=args.seed)
-    elif args.scenario == "T8":
-        success = run_scenario_t8(seed=args.seed)
+        for name, fn in scenarios.items():
+            success = fn() and success
+    elif args.scenario in scenarios:
+        success = scenarios[args.scenario]()
 
     sys.exit(0 if success else 1)
 
