@@ -264,6 +264,7 @@ def test_scenario_t5_unreliable_network_before_stabilization():
     net = create_scenario_network(num_validators=10, fault_config=fault_cfg, seed=789)
     nodes = net["nodes"]
     sim = net["simulator"]
+    transport = net["transport"]
     chain_id = net["chain_id"]
 
     client = KeyPair.from_seed("client_t5")
@@ -278,12 +279,23 @@ def test_scenario_t5_unreliable_network_before_stabilization():
         max_time=30.0,
     )
 
-    # Check that safety holds: no conflicting finalized blocks
+    # 1. Check Liveness: all honest nodes finalized height 1
     for n in nodes:
         assert len(n.engine.ledger) >= 1, "Liveness failed: node did not finalize after stabilization"
 
+    # 2. Check Safety: no conflicting finalized blocks or state roots
     finalized_hashes = {n.engine.ledger[0].hash() for n in nodes}
     assert len(finalized_hashes) == 1, f"Safety violation under T5! Hashes: {finalized_hashes}"
+    state_roots = {n.engine.committed_state.compute_merkle_root() for n in nodes}
+    assert len(state_roots) == 1, f"State root mismatch under T5! Roots: {state_roots}"
+
+    # 3. Assert Partial Synchrony bound: zero drops post-stabilization for honest nodes
+    assert transport.stabilized_drops == 0, f"Violated partial synchrony: {transport.stabilized_drops} drops after t_stabilize"
+
+    # 4. Assert Delta delivery bound for all post-stabilization messages
+    assert len(transport.stabilized_deliveries) > 0, "No post-stabilization deliveries tracked"
+    for d in transport.stabilized_deliveries:
+        assert d["delay"] <= fault_cfg.delta + 1e-6, f"Delivery delay {d['delay']} exceeded delta {fault_cfg.delta}"
 
 
 def test_scenario_t7_byzantine_equivocation():
@@ -320,3 +332,57 @@ def test_scenario_t7_byzantine_equivocation():
     # Safety check: Zero forks! All honest nodes must agree on exact same finalized block hash
     finalized_hashes = {n.engine.ledger[0].hash() for n in honest_nodes}
     assert len(finalized_hashes) == 1, f"Safety violation! Found conflicting finalized hashes: {finalized_hashes}"
+
+
+def test_scenario_t8_determinism_replay():
+    """T8: Determinism audit. Run same seed twice and verify byte-identical logs and matching state hash."""
+    from tests.run_e2e import setup_simulation
+
+    def run_sim(seed: int):
+        sim_data = setup_simulation(
+            num_nodes=10,
+            seed=seed,
+            drop_rate=0.2,
+            duplicate_rate=0.1,
+            t_stabilize=1.5,
+            delta=0.2,
+        )
+        nodes = sim_data["nodes"]
+        sim = sim_data["simulator"]
+        logger = sim_data["logger"]
+        chain_id = sim_data["chain_id"]
+
+        # Trigger overactive peer to produce BLOCK and UNBLOCK events deterministically
+        sim.schedule_event(
+            0.05,
+            lambda: [nodes[0].handle_message("spam_test_peer", {"type": "SPAM", "seq": i}) for i in range(35)],
+        )
+
+        client = KeyPair.from_seed("client_t8")
+        add_tx(nodes, client, "doc_t8", "0x8888", 1, chain_id)
+
+        for n in nodes:
+            n.engine.start_height(1)
+
+        sim.run_until_condition(
+            condition=lambda: all(len(n.engine.ledger) >= 1 for n in nodes),
+            max_time=25.0,
+        )
+
+        assert all(len(n.engine.ledger) >= 1 for n in nodes), "All nodes must finalize height 1"
+        final_state_root = nodes[0].engine.committed_state.compute_merkle_root()
+        full_log = logger.get_full_log()
+        return final_state_root, full_log
+
+    root1, log1 = run_sim(seed=42)
+    root2, log2 = run_sim(seed=42)
+
+    # 1. State roots must match identically
+    assert root1 == root2, f"State root mismatch across identical runs: {root1} != {root2}"
+
+    # 2. Log contents must be byte-identical
+    assert log1 == log2, "Logs differed across identical simulation runs!"
+
+    # 3. Log must contain all required event types
+    for evt in ["SEND", "DROP", "DELAY", "BLOCK", "UNBLOCK", "PROPOSE", "PREVOTE", "PRECOMMIT", "FINALIZE"]:
+        assert f"[{evt}]" in log1, f"Missing required event type [{evt}] in deterministic log"

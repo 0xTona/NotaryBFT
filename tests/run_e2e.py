@@ -4,6 +4,14 @@ import argparse
 import hashlib
 import os
 import sys
+
+# Ensure repository root and site-packages are in sys.path
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+if "/tmp/site-packages" not in sys.path and os.path.exists("/tmp/site-packages"):
+    sys.path.insert(0, "/tmp/site-packages")
+
 import pytest
 from src.byzantine.behaviors import ByzantineMode
 from src.consensus.proposer import get_proposer
@@ -17,10 +25,11 @@ from src.network.simulator import Simulator
 
 
 def run_unit_tests() -> bool:
-    print("\n=== Running Member 1 Unit Tests ===")
+    print("\n=== Running Unit Test Suites (Member 1 & Member 2) ===")
     ret = pytest.main([
         "tests/test_consensus.py",
         "tests/test_block_validation.py",
+        "tests/test_network.py",
         "-v",
     ])
     return ret == 0
@@ -211,6 +220,7 @@ def run_scenario_t5(seed: int = 42) -> bool:
     )
     nodes = sim_data["nodes"]
     sim = sim_data["simulator"]
+    transport = sim_data["transport"]
     chain_id = sim_data["chain_id"]
 
     client = KeyPair.from_seed("client_t5")
@@ -224,12 +234,26 @@ def run_scenario_t5(seed: int = 42) -> bool:
 
     sim.run_until_condition(lambda: all(len(n.engine.ledger) >= 1 for n in nodes), max_time=30.0)
 
-    ok = all(len(n.engine.ledger) >= 1 for n in nodes)
+    # 1. Assert liveness: all honest nodes finalized height 1
+    all_finalized = all(len(n.engine.ledger) >= 1 for n in nodes)
+
+    # 2. Assert safety: no conflicting blocks or state roots at height 1
+    hashes = {n.engine.ledger[0].hash() for n in nodes} if all_finalized else set()
+    state_roots = {n.engine.committed_state.compute_merkle_root() for n in nodes} if all_finalized else set()
+    safety_ok = (len(hashes) == 1) and (len(state_roots) == 1)
+
+    # 3. Assert partial synchrony bound: zero drops post-stabilization for honest nodes
+    zero_drops = (transport.stabilized_drops == 0)
+
+    # 4. Assert Delta delivery bound for all post-stabilization deliveries
+    deliveries = transport.stabilized_deliveries
+    delta_bound_ok = (len(deliveries) > 0) and all(d["delay"] <= transport.config.delta + 1e-6 for d in deliveries)
+
+    ok = all_finalized and safety_ok and zero_drops and delta_bound_ok
     if ok:
-        hashes = {n.engine.ledger[0].hash() for n in nodes}
-        ok = len(hashes) == 1
-        if ok:
-            print(f"[SUCCESS] T5 Passed: Safety preserved during drops, liveness achieved after stabilization. Block {list(hashes)[0][:12]}")
+        print(f"[SUCCESS] T5 Passed: Safety preserved during drops, liveness achieved after stabilization. Zero drops post-stabilization ({len(deliveries)} msgs within delta={transport.config.delta}s). Block {list(hashes)[0][:12]}")
+    else:
+        print(f"[FAILED] T5 Failed: all_finalized={all_finalized}, safety_ok={safety_ok}, zero_drops={zero_drops}, delta_bound_ok={delta_bound_ok}")
     return ok
 
 
@@ -306,11 +330,56 @@ def run_scenario_t8(seed: int = 42) -> bool:
     log1 = "logs/t8_run1.log"
     log2 = "logs/t8_run2.log"
 
-    ok1 = run_scenario_t1(seed=seed, log_file=log1)
-    ok2 = run_scenario_t1(seed=seed, log_file=log2)
+    def execute_deterministic_simulation(out_log: str) -> tuple[bool, str]:
+        sim_data = setup_simulation(
+            num_nodes=10,
+            seed=seed,
+            drop_rate=0.2,
+            duplicate_rate=0.1,
+            t_stabilize=1.5,
+            delta=0.2,
+            log_file=out_log,
+        )
+        nodes = sim_data["nodes"]
+        sim = sim_data["simulator"]
+        logger = sim_data["logger"]
+        chain_id = sim_data["chain_id"]
+
+        # Schedule overactive peer burst to exercise BLOCK and UNBLOCK events deterministically
+        sim.schedule_event(
+            0.05,
+            lambda: [nodes[0].handle_message("spam_test_peer", {"type": "SPAM", "seq": i}) for i in range(35)],
+        )
+
+        client = KeyPair.from_seed("client_t8")
+        tx = Transaction(sender=client.public_key_hex, doc_id="doc_t8", doc_hash="0x8888", nonce=1)
+        tx.signature = sign_payload(client, get_tx_domain(chain_id), tx.signing_payload())
+        for n in nodes:
+            n.engine.mempool.append(tx)
+
+        for n in nodes:
+            n.engine.start_height(1)
+
+        sim.run_until_condition(lambda: all(len(n.engine.ledger) >= 1 for n in nodes), max_time=25.0)
+
+        all_finalized = all(len(n.engine.ledger) >= 1 for n in nodes)
+        state_root = nodes[0].engine.committed_state.compute_merkle_root() if all_finalized else ""
+
+        if out_log:
+            os.makedirs(os.path.dirname(out_log) or ".", exist_ok=True)
+            logger.write_to_file(out_log)
+
+        return all_finalized, state_root
+
+    ok1, state_root1 = execute_deterministic_simulation(log1)
+    ok2, state_root2 = execute_deterministic_simulation(log2)
 
     if not (ok1 and ok2):
-        print("[FAILED] T8 Failed: one of the simulation runs failed")
+        print("[FAILED] T8 Failed: one of the simulation runs failed to finalize")
+        return False
+
+    if state_root1 != state_root2:
+        print(f"[FAILED] T8 Failed: state roots differed across identical seeds! {state_root1} != {state_root2}")
         return False
 
     with open(log1, "rb") as f1, open(log2, "rb") as f2:
@@ -320,12 +389,21 @@ def run_scenario_t8(seed: int = 42) -> bool:
     sha1 = hashlib.sha256(bytes1).hexdigest()
     sha2 = hashlib.sha256(bytes2).hexdigest()
 
-    if bytes1 == bytes2:
-        print(f"[SUCCESS] T8 Passed: Byte-identical logs verified!\n  Run 1 SHA256: {sha1}\n  Run 2 SHA256: {sha2}")
-        return True
-    else:
+    if bytes1 != bytes2:
         print(f"[FAILED] T8 Failed: Log output differed across identical seeds!\n  Run 1 SHA256: {sha1}\n  Run 2 SHA256: {sha2}")
         return False
+
+    log_str = bytes1.decode("utf-8")
+    missing_events = [
+        evt for evt in ["SEND", "DROP", "DELAY", "BLOCK", "UNBLOCK", "PROPOSE", "PREVOTE", "PRECOMMIT", "FINALIZE"]
+        if f"[{evt}]" not in log_str
+    ]
+    if missing_events:
+        print(f"[FAILED] T8 Failed: Log output missing required events: {missing_events}")
+        return False
+
+    print(f"[SUCCESS] T8 Passed: Byte-identical logs verified!\n  Run 1 SHA256: {sha1}\n  Run 2 SHA256: {sha2}\n  Identical final state root: {state_root1[:12]}\n  Verified presence of all required event types: SEND, DROP, DELAY, BLOCK, UNBLOCK, PROPOSE, PREVOTE, PRECOMMIT, FINALIZE")
+    return True
 
 
 def main():
