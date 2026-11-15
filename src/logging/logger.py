@@ -27,6 +27,8 @@ class DeterministicLogger:
         "TIMEOUT_PRECOMMIT",
         "SILENT_PROPOSER_DROP",
         "TX_ACCEPT",
+        "SYNC_REQUEST",
+        "SYNC_COMMIT",
     }
 
     def __init__(self, log_to_console: bool = False):

@@ -43,6 +43,7 @@ class ConsensusEngine:
         schedule_timeout_fn: Optional[Callable[[str, int, int, float], None]] = None,
         cancel_timeout_fn: Optional[Callable[[str, int, int], None]] = None,
         on_finalized_fn: Optional[Callable[[Block, State], None]] = None,
+        request_block_fn: Optional[Callable[[str, int, int, List[str]], None]] = None,
     ):
         n = len(validators)
         if n < 8 or (n - 1) % 3 != 0:
@@ -64,6 +65,9 @@ class ConsensusEngine:
         self.schedule_timeout_fn = schedule_timeout_fn
         self.cancel_timeout_fn = cancel_timeout_fn
         self.on_finalized_fn = on_finalized_fn
+        # Asks the network layer to fetch a block that has a precommit quorum but is
+        # not known locally: (block_hash, height, round, validators_that_precommitted)
+        self.request_block_fn = request_block_fn
 
         # Consensus state variables
         self.height: int = 1
@@ -85,6 +89,11 @@ class ConsensusEngine:
         self.vote_sets: Dict[Tuple[int, int, str], VoteSet] = {}
         # Key: (height, round) -> Block
         self.proposal_blocks: Dict[Tuple[int, int], Block] = {}
+        # Every received block body by hash (a precommit quorum names a hash, and an
+        # equivocating proposer may overwrite proposal_blocks for the same (h, r))
+        self.blocks_by_hash: Dict[str, Block] = {}
+        # height -> precommit votes (2f + 1, same block) that finalized that height
+        self.commit_certificates: Dict[int, List[Vote]] = {}
 
         # Pending transactions pool
         self.mempool: List[Transaction] = []
@@ -99,6 +108,11 @@ class ConsensusEngine:
         self.locked_round = -1
         self.valid_block = None
         self.valid_round = -1
+
+        # Catch-up: a node that lagged behind may already hold a precommit quorum for
+        # this height (votes are buffered for any height). Commit it directly.
+        if self._commit_from_stored_precommits():
+            return
 
         self.start_round(0)
 
@@ -117,12 +131,12 @@ class ConsensusEngine:
             # This node is the elected proposer
             proposal = self._create_proposal()
             self._broadcast_proposal(proposal)
-            self.on_receive_proposal(proposal)
+            self.on_receive_proposal(proposal, self.round)
 
         # Check if proposal for this round was already received asynchronously
         cached_proposal = self.proposal_blocks.get((self.height, self.round))
         if cached_proposal is not None:
-            self.on_receive_proposal(cached_proposal)
+            self.on_receive_proposal(cached_proposal, self.round)
         else:
             # Schedule TimeoutPropose
             timeout_dur = self.timeout_config.timeout_propose(self.round)
@@ -136,24 +150,27 @@ class ConsensusEngine:
                     self._process_vote_triggers(v)
 
     def _create_proposal(self) -> Block:
-        """Constructs a block proposal. If valid_block exists, reproposes it; otherwise creates a new block."""
+        """Constructs a block proposal. If valid_block exists, reproposes it; otherwise creates a new block.
+
+        A reproposal is the *same* block (original header, round and signature), as in
+        Tendermint. Re-signing it under the new round would change its hash, so
+        validators locked on it could never prevote it again and a lock split between
+        validators would stall the height forever.
+        """
         parent_hash = self.ledger[-1].hash() if self.ledger else "0" * 64
 
         if self.valid_block is not None:
-            # Repropose valid_block with updated round
-            txs = deepcopy(self.valid_block.txs)
-            state_root = self.valid_block.header.state_root
-            txs_hash = self.valid_block.header.txs_hash
-        else:
-            # Select pending valid transactions
-            txs = []
-            temp_state = self.committed_state.clone()
-            for tx in list(self.mempool):
-                ok, _ = temp_state.apply_transaction(tx, self.chain_id)
-                if ok:
-                    txs.append(tx)
-            state_root = temp_state.compute_merkle_root()
-            txs_hash = compute_txs_hash(txs)
+            return self.valid_block
+
+        # Select pending valid transactions
+        txs = []
+        temp_state = self.committed_state.clone()
+        for tx in list(self.mempool):
+            ok, _ = temp_state.apply_transaction(tx, self.chain_id)
+            if ok:
+                txs.append(tx)
+        state_root = temp_state.compute_merkle_root()
+        txs_hash = compute_txs_hash(txs)
 
         header = BlockHeader(
             chain_id=self.chain_id,
@@ -177,24 +194,52 @@ class ConsensusEngine:
             self._cast_prevote(None)
             self.step = Step.PREVOTE
 
-    def on_receive_proposal(self, block: Block) -> None:
-        """Processes an incoming block proposal."""
+    def on_receive_proposal(self, block: Block, proposal_round: Optional[int] = None) -> None:
+        """Processes an incoming block proposal.
+
+        proposal_round is the round in which the block is being proposed. It equals
+        block.header.round for a fresh block and is larger for a reproposal of a block
+        created in an earlier round (the network layer only accepts a reproposal from
+        the designated proposer of proposal_round).
+        """
         h = block.header
-        if h.height != self.height:
+        pr = h.round if proposal_round is None else proposal_round
+        if h.height < self.height or pr < h.round:
             return
 
-        # Record proposal
-        self.proposal_blocks[(h.height, h.round)] = block
+        # Record proposal. Future-height proposals are buffered so a node that is still
+        # finishing the previous height does not lose the next proposer's block;
+        # start_round() validates them once the node reaches that height.
+        self.proposal_blocks[(h.height, pr)] = block
+        self.blocks_by_hash[block.hash()] = block
+        if h.height > self.height:
+            return
 
-        if self.step == Step.PROPOSE and h.round == self.round:
+        self._handle_current_height_proposal(block, pr)
+
+        # Late proposal: the precommit quorum for it may already have been collected
+        # (e.g. the body arrived after the votes). Commit it now.
+        if self.height == h.height:
+            for (vh, _vr, phase), vset in list(self.vote_sets.items()):
+                if vh == h.height and phase == Phase.PRECOMMIT and vset.has_quorum_for(block.hash()):
+                    self._finalize_block(block)
+                    break
+
+    def _handle_current_height_proposal(self, block: Block, proposal_round: int) -> None:
+        """Validates and prevotes a proposal for the current height and round."""
+        h = block.header
+
+        if self.step == Step.PROPOSE and proposal_round == self.round:
             self._cancel_timeout("PROPOSE", self.height, self.round)
 
             parent_block = self.ledger[-1] if self.ledger else None
+            # Rule 3 is checked against the round the block was created in: its header
+            # must be signed by that round's proposer (unchanged for a reproposal).
             is_valid, err, _ = validate_block_proposal(
                 block=block,
                 chain_id=self.chain_id,
                 current_height=self.height,
-                current_round=self.round,
+                current_round=h.round,
                 parent_block=parent_block,
                 parent_state=self.committed_state,
                 validators=self.validators,
@@ -326,8 +371,8 @@ class ConsensusEngine:
                 self._cancel_timeout("PREVOTE", self.height, self.round)
                 if q_block_hash is not None:
                     # Rule 4: Quorum for non-NIL block -> lock block and record locked_round
-                    prop_block = self.proposal_blocks.get((self.height, self.round))
-                    if prop_block and prop_block.hash() == q_block_hash:
+                    prop_block = self.blocks_by_hash.get(q_block_hash)
+                    if prop_block is not None and prop_block.header.height == self.height:
                         self.locked_block = prop_block
                         self.locked_round = self.round
                         self.valid_block = prop_block
@@ -351,9 +396,12 @@ class ConsensusEngine:
             if has_quorum:
                 if q_block_hash is not None:
                     self._cancel_timeout("PRECOMMIT", self.height, self.round)
-                    prop_block = self.proposal_blocks.get((vote.height, vote.round))
-                    if prop_block and prop_block.hash() == q_block_hash:
+                    prop_block = self.blocks_by_hash.get(q_block_hash)
+                    if prop_block is not None:
                         self._finalize_block(prop_block)
+                    else:
+                        # Decided block never reached us: fetch it from the precommitters
+                        self._request_block(q_block_hash, vote.height, vote.round, vote_set)
                 elif vote.round == self.round:
                     self._cancel_timeout("PRECOMMIT", self.height, self.round)
                     if self.step == Step.PRECOMMIT:
@@ -379,6 +427,11 @@ class ConsensusEngine:
 
     def _finalize_block(self, block: Block) -> None:
         """Finalizes block, executes state transition, updates ledger, and advances height."""
+        if block.header.height != self.height:
+            return  # already finalized (several paths can detect the same quorum)
+        parent_hash = self.ledger[-1].hash() if self.ledger else "0" * 64
+        if block.header.parent_hash != parent_hash or block.header.chain_id != self.chain_id:
+            return
         ok, new_state, _, receipts, err = Executor.execute_block(
             self.committed_state, block, self.chain_id
         )
@@ -387,6 +440,15 @@ class ConsensusEngine:
 
         self.committed_state = new_state
         self.ledger.append(block)
+        # Keep the precommit quorum (commit certificate) so lagging peers can be helped
+        # to finalize this height after we have moved on.
+        block_hash = block.hash()
+        for (vh, _vr, phase), vset in self.vote_sets.items():
+            if vh == block.header.height and phase == Phase.PRECOMMIT and vset.has_quorum_for(block_hash):
+                self.commit_certificates[vh] = [
+                    v for v in vset.votes.values() if not v.is_nil() and v.block_hash == block_hash
+                ]
+                break
 
         # Prune applied transactions from mempool
         applied_hashes = {tx.hash() for tx in block.txs}
@@ -397,6 +459,38 @@ class ConsensusEngine:
 
         # Advance to next height
         self.start_height(self.height + 1)
+
+    def _commit_from_stored_precommits(self) -> bool:
+        """Finalizes the current height from an already-buffered precommit quorum.
+
+        Returns True if the height was finalized (the engine has moved on). If the
+        quorum names a block we do not have, the block is requested and False is
+        returned so the node keeps participating normally while it waits.
+        """
+        candidates = sorted(
+            ((r, vset) for (h, r, phase), vset in self.vote_sets.items()
+             if h == self.height and phase == Phase.PRECOMMIT),
+            key=lambda item: item[0],
+        )
+        for r, vset in candidates:
+            has_quorum, q_hash = vset.get_quorum_block()
+            if not has_quorum or q_hash is None:
+                continue
+            block = self.blocks_by_hash.get(q_hash)
+            if block is not None:
+                self._finalize_block(block)
+                return self.height != vset.height
+            self._request_block(q_hash, vset.height, r, vset)
+        return False
+
+    def _request_block(self, block_hash: str, height: int, round_num: int, vote_set: VoteSet) -> None:
+        if self.request_block_fn is None:
+            return
+        voters = [
+            vid for vid, v in vote_set.votes.items()
+            if not v.is_nil() and v.block_hash == block_hash and vid != self.node_id
+        ]
+        self.request_block_fn(block_hash, height, round_num, voters)
 
     def _find_polka_evidence(self, block_hash: str, height: int) -> Optional[VoteSet]:
         """Finds any VoteSet in a prior round (> locked_round) with a 2f+1 quorum for block_hash."""

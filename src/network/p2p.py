@@ -118,6 +118,16 @@ class Node:
         self.known_blocks: Dict[str, Block] = {}
         # Accepted headers tracking for Header-First protocol
         self.accepted_headers: Dict[str, BlockHeader] = {}
+        # Headers up to this many heights ahead are accepted and their bodies fetched
+        self.future_header_window: int = 2
+        # Rounds in which a not-yet-downloaded block was proposed: block_hash -> {round}
+        self.pending_proposal_rounds: Dict[str, set] = {}
+        # Block sync: block_hash -> (height, round, voters) for outstanding requests
+        self.pending_sync: Dict[str, Tuple[int, int, List[str]]] = {}
+        self.sync_retry_interval: float = 0.5
+        # Commit-certificate serving to lagging peers: (peer, height) -> last send time
+        self.commit_served: Dict[Tuple[str, int], float] = {}
+        self.commit_serve_interval: float = 1.0
 
         # Instantiate Consensus State Machine
         self.engine = ConsensusEngine(
@@ -131,6 +141,7 @@ class Node:
             schedule_timeout_fn=self.schedule_timeout,
             cancel_timeout_fn=self.cancel_timeout,
             on_finalized_fn=self.on_finalized,
+            request_block_fn=self.request_block,
         )
 
         self.transport.register_node(self.node_id, self.handle_message)
@@ -204,8 +215,15 @@ class Node:
             if r != self.node_id:
                 self.send_outbound(r, message, height, round_num)
 
-    def broadcast_proposal(self, block: Block) -> None:
-        """Header-first broadcast: Proposer first broadcasts BlockHeader."""
+    def broadcast_proposal(self, block: Block, proposal_round: Optional[int] = None) -> None:
+        """Header-first broadcast: Proposer first broadcasts BlockHeader.
+
+        proposal_round defaults to the engine's current round; it differs from
+        block.header.round when the engine reproposes its valid block unchanged.
+        """
+        if proposal_round is None:
+            proposal_round = (self.engine.round if block.header.height == self.engine.height
+                              else block.header.round)
         if self.byzantine_mode == ByzantineMode.SILENT_PROPOSER:
             if self.logger:
                 self.logger.log(
@@ -213,7 +231,7 @@ class Node:
                     self.node_id,
                     "SILENT_PROPOSER_DROP",
                     block.header.height,
-                    block.header.round,
+                    proposal_round,
                     f"Dropped proposal {block.hash()[:8]}",
                 )
             return
@@ -221,19 +239,22 @@ class Node:
         self.known_blocks[block.hash()] = block
         self.accepted_headers[block.hash()] = block.header
         if self.logger:
+            details = f"block_hash={block.hash()[:8]}"
+            if proposal_round != block.header.round:
+                details += f" reproposal_of_round={block.header.round}"
             self.logger.log(
                 self.simulator.now(),
                 self.node_id,
                 "PROPOSE",
                 block.header.height,
-                block.header.round,
-                f"block_hash={block.hash()[:8]}",
+                proposal_round,
+                details,
             )
 
         # Header-first message broadcast via rate-limited outbound channel
-        msg = {"type": "HEADER", "header": block.header}
+        msg = {"type": "HEADER", "header": block.header, "proposal_round": proposal_round}
         self.broadcast_outbound(
-            self.validators, msg, block.header.height, block.header.round
+            self.validators, msg, block.header.height, proposal_round
         )
 
     def broadcast_vote(self, vote: Vote) -> None:
@@ -354,14 +375,32 @@ class Node:
                     self.logger.log(now, self.node_id, "DROP", cur_h, cur_r, "REJECT_HEADER: malformed header object")
                 return
 
+            # 0. Proposal round: equals header.round for a fresh block. A larger value is a
+            #    Tendermint-style reproposal of an earlier block, accepted only when it is
+            #    relayed by the designated proposer of that later round.
+            proposal_round = msg.get("proposal_round", header.round)
+            if (not isinstance(proposal_round, int) or isinstance(proposal_round, bool)
+                    or proposal_round < header.round):
+                if self.logger:
+                    self.logger.log(now, self.node_id, "DROP", cur_h, cur_r, "REJECT_HEADER: invalid proposal_round")
+                return
+            if proposal_round != header.round and sender_id != get_proposer(self.validators, header.height, proposal_round):
+                if self.logger:
+                    self.logger.log(now, self.node_id, "DROP", cur_h, cur_r, f"REJECT_HEADER: reproposal for round {proposal_round} not sent by its proposer")
+                return
+
             # 1. Chain ID check
             if header.chain_id != self.chain_id:
                 if self.logger:
                     self.logger.log(now, self.node_id, "DROP", cur_h, cur_r, f"REJECT_HEADER: chain_id mismatch (expected {self.chain_id}, got {header.chain_id})")
                 return
 
-            # 2. Height check: must match current engine height
-            if header.height != self.engine.height:
+            # 2. Height check: current height, or a near-future height. A node that is
+            #    still finishing height h must not lose the proposal for h+1 that a
+            #    faster peer already broadcast; the parent link of a future header is
+            #    checked by the engine (Rule 3) once the node reaches that height.
+            is_future = self.engine.height < header.height <= self.engine.height + self.future_header_window
+            if header.height != self.engine.height and not is_future:
                 if self.logger:
                     self.logger.log(now, self.node_id, "DROP", cur_h, cur_r, f"REJECT_HEADER: height mismatch (current {self.engine.height}, header {header.height})")
                 return
@@ -373,9 +412,9 @@ class Node:
                     self.logger.log(now, self.node_id, "DROP", cur_h, cur_r, f"REJECT_HEADER: proposer mismatch (expected {expected_proposer[:8]}, got {header.proposer[:8]})")
                 return
 
-            # 4. Parent Hash check
+            # 4. Parent Hash check (current height only; see step 2)
             expected_parent = self.engine.ledger[-1].hash() if self.engine.ledger else "0" * 64
-            if header.parent_hash != expected_parent:
+            if not is_future and header.parent_hash != expected_parent:
                 if self.logger:
                     self.logger.log(now, self.node_id, "DROP", cur_h, cur_r, f"REJECT_HEADER: parent_hash mismatch (expected {expected_parent[:8]}, got {header.parent_hash[:8]})")
                 return
@@ -391,10 +430,23 @@ class Node:
             block_h = header.hash()
             self.accepted_headers[block_h] = header
 
-            # Header-first flow: receiver requests body only after header is accepted
-            if block_h not in self.known_blocks:
+            if block_h in self.known_blocks:
+                # Body already held (e.g. a reproposal of a block seen in an earlier round)
+                self.engine.on_receive_proposal(self.known_blocks[block_h], proposal_round)
+            else:
+                # Header-first flow: receiver requests body only after header is accepted
+                self.pending_proposal_rounds.setdefault(block_h, set()).add(proposal_round)
                 req = {"type": "GET_BODY", "hash": block_h, "header": header}
                 self.send_outbound(sender_id, req, header.height, header.round)
+
+        elif mtype == "GET_HEADER":
+            # Block sync: a lagging peer asks for a decided block. Header-first still
+            # holds: we resend the HEADER and the peer requests the body after accepting it.
+            block_h = msg.get("hash")
+            if block_h in self.known_blocks:
+                block = self.known_blocks[block_h]
+                self.send_outbound(sender_id, {"type": "HEADER", "header": block.header},
+                                   block.header.height, block.header.round)
 
         elif mtype == "GET_BODY":
             block_h = msg.get("hash")
@@ -424,9 +476,12 @@ class Node:
                     self.logger.log(now, self.node_id, "DROP", cur_h, cur_r, f"REJECT_BODY: txs_hash mismatch (expected {block.header.txs_hash[:8]}, computed {computed_txs_hash[:8]})")
                 return
 
-            # Valid body -> store and forward to Consensus Engine
+            # Valid body -> store and forward to Consensus Engine, once per round in
+            # which this block was proposed (its own round plus any reproposal rounds)
             self.known_blocks[block_h] = block
-            self.engine.on_receive_proposal(block)
+            rounds = self.pending_proposal_rounds.pop(block_h, set()) | {block.header.round}
+            for pr in sorted(rounds):
+                self.engine.on_receive_proposal(block, pr)
 
         elif mtype == "VOTE":
             vote = msg.get("vote")
@@ -440,6 +495,9 @@ class Node:
                 if self.logger:
                     self.logger.log(now, self.node_id, "DROP", cur_h, cur_r, f"REJECT_VOTE: {reason}")
                 return
+            if vote.height < self.engine.height:
+                # The sender is still working on a height we already finalized
+                self._serve_commit(sender_id, vote.height)
             self.engine.on_receive_vote(vote)
 
     def submit_transaction(self, tx: Transaction) -> Tuple[bool, str]:
@@ -467,6 +525,59 @@ class Node:
         if self.logger:
             self.logger.log(now, self.node_id, "TX_ACCEPT", h, r, f"tx={tx.hash()[:8]} nonce={tx.nonce}")
         return True, ""
+
+    def request_block(self, block_hash: str, height: int, round_num: int, voters: List[str]) -> None:
+        """Engine callback: a precommit quorum names a block we never received.
+
+        Ask the validators that precommitted it (at least f + 1 of them are honest
+        and hold the block) to resend its header; retry until the block arrives or
+        the node moves past that height, so the request survives lossy links.
+        """
+        if block_hash in self.pending_sync:
+            return
+        self.pending_sync[block_hash] = (height, round_num, list(voters))
+        self._send_sync_request(block_hash)
+
+    def _send_sync_request(self, block_hash: str) -> None:
+        entry = self.pending_sync.get(block_hash)
+        if entry is None:
+            return
+        height, round_num, voters = entry
+        if self.engine.height != height or block_hash in self.engine.blocks_by_hash:
+            del self.pending_sync[block_hash]
+            return
+        if self.logger:
+            self.logger.log(
+                self.simulator.now(), self.node_id, "SYNC_REQUEST", height, round_num,
+                f"block_hash={block_hash[:8]} peers={len(voters)}",
+            )
+        for peer in voters:
+            if peer != self.node_id:
+                self.send_outbound(peer, {"type": "GET_HEADER", "hash": block_hash}, height, round_num)
+        self.simulator.schedule_event(
+            self.sync_retry_interval, lambda h=block_hash: self._send_sync_request(h)
+        )
+
+    def _serve_commit(self, peer_id: str, height: int) -> None:
+        """Sends a lagging peer the signed precommits that finalized `height`.
+
+        Validators that already decided stop voting at that height, so without this
+        the remaining nodes might never see 2f + 1 precommits. The votes are signed,
+        so the peer verifies them like any other vote. Throttled per (peer, height).
+        """
+        cert = self.engine.commit_certificates.get(height)
+        if not cert or peer_id not in self.validators:
+            return
+        now = self.simulator.now()
+        last = self.commit_served.get((peer_id, height))
+        if last is not None and now - last < self.commit_serve_interval:
+            return
+        self.commit_served[(peer_id, height)] = now
+        if self.logger:
+            self.logger.log(now, self.node_id, "SYNC_COMMIT", height, cert[0].round,
+                            f"to={peer_id[:8]} votes={len(cert)}")
+        for v in cert:
+            self.send_outbound(peer_id, {"type": "VOTE", "vote": v}, v.height, v.round)
 
     def on_finalized(self, block: Block, state: Any) -> None:
         if self.logger:

@@ -85,7 +85,7 @@ src/
   byzantine/  equivocation, silent proposer, invalid block and replay injectors
   network/    discrete-event simulator, unreliable links, header-first P2P, rate limiting
   logging/    deterministic structured logger
-tests/     unit tests (crypto, state, consensus, block validation, network), scenario tests, run_e2e.py
+tests/     unit tests (crypto, state, consensus, block validation, network, liveness), scenario tests, run_e2e.py
 scripts/   pack_submission.py
 logs/      generated scenario logs
 ```
@@ -102,6 +102,10 @@ logs/      generated scenario logs
 - **State commitment**: binary Merkle tree over keys sorted by UTF-8 bytes, leaf
   `SHA256(0x00 || len(k) || k || len(v) || v)`, inner `SHA256(0x01 || L || R)`, unpaired node promoted,
   empty root `SHA256("")`.
+- **Catch-up**: headers up to 2 heights ahead are buffered; a node holding a precommit quorum for a block
+  it lacks fetches it (`SYNC_REQUEST`, header-first); reproposals reuse the original block so locks stay
+  valid across rounds; nodes send the commit certificate of a finished height to peers still voting on it
+  (`SYNC_COMMIT`).
 - **Consensus, network and logging**: see the module docstrings in `src/consensus`, `src/network` and `src/logging`.
 
 ## Packaging the submission

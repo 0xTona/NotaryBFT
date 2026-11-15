@@ -71,7 +71,25 @@ Diagram (to draw): Client → `Node.submit_transaction` → mempool → proposer
    domain prefixes, promotion of the unpaired node.
 3. **Non-canonical identities/signatures.** Uppercase hex keys or signatures also verified, giving several
    spellings (and tx hashes) for one logical message. Fix: accept lowercase hex only.
-4. **[TODO M1/M2]** add consensus and network bugs.
+4. **Lagging nodes lost the next proposal.** A node still finishing height h rejected the header for h+1
+   that a faster proposer had already broadcast (`height mismatch`), and nothing resent it, so the node
+   stalled even with no faults (T1 failed for seeds 6-10). Fix: accept headers up to 2 heights ahead and
+   buffer the block in the engine until that height starts (Rule 3 is checked then).
+5. **Late proposal never committed.** If the body arrived after the precommit quorum, the engine stored
+   it but never re-checked the quorum. Fix: on every proposal, check buffered precommits for its hash; if a
+   quorum names a block we do not have, request it (`GET_HEADER` → `HEADER` → `GET_BODY` → `BODY`, retried
+   every 0.5 s, header-first preserved).
+6. **Lock split deadlock.** A reproposal was re-signed with the new round, which changed its hash. Validators
+   locked on the old hash could then never prevote it, so a split such as 5 locked / 5 unlocked stalled the
+   height forever (T8, seed 1). Fix (Tendermint): repropose the *same* block; the HEADER message carries
+   `proposal_round`, accepted only from that round's proposer.
+7. **Decided nodes stop voting.** Nodes that finalized h left too few voters for the rest, whose precommits
+   had been dropped (T8, seed 10). Fix: each node keeps the 2f + 1 precommits that finalized each height
+   (commit certificate) and, when a validator sends a vote for an older height, sends it those signed
+   precommits (throttled to once per second per peer and height).
+
+Validation: 0 failures over seeds 1-30 (n = 10), seeds 1-8 for n = 13 and 16, and seeds 1-10 with the
+file-driven topology; regression tests in `tests/test_liveness.py`.
 
 ## 6. Testing and results
 
