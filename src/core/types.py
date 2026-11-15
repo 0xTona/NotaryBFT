@@ -6,12 +6,27 @@ from typing import Any, Dict, List, Optional
 from src.crypto.encoding import canonical_hash
 
 
-class Phase(str, Enum):
+class _StrValueEnum(str, Enum):
+    """str-valued Enum whose str()/format() is the bare value on every Python version.
+
+    Since Python 3.11, format() of a (str, Enum) member yields "Phase.PREVOTE"
+    instead of "PREVOTE". Signed payloads and logs must not depend on the
+    interpreter version, so the textual form is pinned to the value here.
+    """
+
+    def __str__(self) -> str:
+        return str(self.value)
+
+    def __format__(self, format_spec: str) -> str:
+        return format(str(self.value), format_spec)
+
+
+class Phase(_StrValueEnum):
     PREVOTE = "PREVOTE"
     PRECOMMIT = "PRECOMMIT"
 
 
-class Step(str, Enum):
+class Step(_StrValueEnum):
     NEW_ROUND = "NEW_ROUND"
     PROPOSE = "PROPOSE"
     PREVOTE = "PREVOTE"
@@ -107,7 +122,7 @@ class Vote:
             "block_hash": self.block_hash,
             "chain_id": self.chain_id,
             "height": self.height,
-            "phase": str(self.phase),
+            "phase": self.phase.value if isinstance(self.phase, Enum) else str(self.phase),
             "round": self.round,
             "validator_id": self.validator_id,
         }

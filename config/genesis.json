@@ -1,0 +1,9 @@
+{
+  "chain_id": "layer1-chain",
+  "description": "Genesis for the NotaryBFT document-notarization chain. Validator set is fixed for a run.",
+  "num_validators": 10,
+  "f": 3,
+  "quorum": 7,
+  "validator_key_seed_template": "val_key_{index}_seed_{seed}",
+  "initial_state": {}
+}

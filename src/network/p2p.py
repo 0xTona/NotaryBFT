@@ -1,11 +1,13 @@
 """P2P layer: Header-first gossip propagation, traffic control (rate limiting), and node harness."""
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from src.byzantine.behaviors import ByzantineMode, create_equivocating_prevotes
 from src.consensus.engine import ConsensusEngine
 from src.consensus.proposer import TimeoutConfig, get_proposer
-from src.core.types import Block, BlockHeader, Vote, compute_txs_hash
+from src.consensus.rules import validate_incoming_vote
+from src.core.state import validate_transaction_stateless
+from src.core.types import Block, BlockHeader, Transaction, Vote, compute_txs_hash
 from src.crypto.keys import KeyPair
 from src.crypto.sign import get_header_domain, verify_payload_signature
 from src.logging.logger import DeterministicLogger
@@ -427,8 +429,44 @@ class Node:
             self.engine.on_receive_proposal(block)
 
         elif mtype == "VOTE":
-            vote: Vote = msg["vote"]
+            vote = msg.get("vote")
+            if not isinstance(vote, Vote):
+                if self.logger:
+                    self.logger.log(now, self.node_id, "DROP", cur_h, cur_r, "REJECT_VOTE: malformed vote object")
+                return
+            # Rule 6 incoming check up front so the rejection reason is logged (T3)
+            ok, reason = validate_incoming_vote(vote, self.chain_id, self.validators)
+            if not ok:
+                if self.logger:
+                    self.logger.log(now, self.node_id, "DROP", cur_h, cur_r, f"REJECT_VOTE: {reason}")
+                return
             self.engine.on_receive_vote(vote)
+
+    def submit_transaction(self, tx: Transaction) -> Tuple[bool, str]:
+        """Client entry point: admits a transaction to the local mempool.
+
+        Rejects malformed transactions and bad/wrong-domain signatures (reason is
+        logged), plus exact duplicates already pending. Nonce/replay checks against
+        committed state happen again at proposal and execution time.
+        """
+        now = self.simulator.now()
+        h, r = self.engine.height, self.engine.round
+        ok, reason = validate_transaction_stateless(tx, self.chain_id)
+        if ok and any(t.hash() == tx.hash() for t in self.engine.mempool):
+            ok, reason = False, "duplicate transaction already in mempool"
+        if ok and tx.nonce <= self.engine.committed_state.get_nonce(tx.sender):
+            ok, reason = False, (
+                f"Invalid nonce: already applied (committed nonce "
+                f"{self.engine.committed_state.get_nonce(tx.sender)}, got {tx.nonce})"
+            )
+        if not ok:
+            if self.logger:
+                self.logger.log(now, self.node_id, "DROP", h, r, f"REJECT_TX: {reason}")
+            return False, reason
+        self.engine.mempool.append(tx)
+        if self.logger:
+            self.logger.log(now, self.node_id, "TX_ACCEPT", h, r, f"tx={tx.hash()[:8]} nonce={tx.nonce}")
+        return True, ""
 
     def on_finalized(self, block: Block, state: Any) -> None:
         if self.logger:
